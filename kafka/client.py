@@ -10,7 +10,7 @@ from kafka.common import (TopicAndPartition, BrokerMetadata,
                           ConnectionError, FailedPayloadsError,
                           KafkaTimeoutError, KafkaUnavailableError,
                           LeaderNotAvailableError, UnknownTopicOrPartitionError,
-                          NotLeaderForPartitionError, ReplicaNotAvailableError)
+                          NotLeaderForPartitionError, ReplicaNotAvailableError, BrokerResponseError)
 
 from kafka.conn import collect_hosts, KafkaConnection, DEFAULT_SOCKET_TIMEOUT_SECONDS
 from kafka.protocol import KafkaProtocol
@@ -150,7 +150,7 @@ class KafkaClient(object):
 
         raise KafkaUnavailableError('All servers failed to process request')
 
-    def _send_broker_aware_request(self, payloads, encoder_fn, decoder_fn):
+    def _send_broker_aware_request(self, payloads, encoder_fn, decoder_fn, fail_on_error=True):
         """
         Group a list of request payloads by topic+partition and send them to
         the leader broker for that partition using the supplied encode/decode
@@ -183,21 +183,22 @@ class KafkaClient(object):
         payloads_by_broker = collections.defaultdict(list)
 
         responses = {}
+        broker_failures = []
         for payload in payloads:
+            # Patched by Zhihu, catch Error when getting leader, and make use of fail_on_error
+            # ORIGINAL CODE is with no try catch block
             try:
                 leader = self._get_leader_for_partition(payload.topic,
                                                         payload.partition)
+
                 payloads_by_broker[leader].append(payload)
                 brokers_for_payloads.append(leader)
-            except KafkaUnavailableError as e:
-                log.warning('KafkaUnavailableError attempting to send request '
-                            'on topic %s partition %d', payload.topic, payload.partition)
-                topic_partition = (payload.topic, payload.partition)
-                responses[topic_partition] = FailedPayloadsError(payload)
-
-        # For each broker, send the list of request payloads
-        # and collect the responses and errors
-        broker_failures = []
+            except (BrokerResponseError, KafkaUnavailableError) as e:
+                log.exception('Caught exception during sending broker aware requests')
+                responses[(payload.topic, payload.partition)] = FailedPayloadsError(payload)
+                broker_failures.append(-1)
+                if fail_on_error:
+                    raise e
 
         # For each KafkaConnection keep the real socket so that we can use
         # a select to perform unblocking I/O
@@ -391,6 +392,7 @@ class KafkaClient(object):
             conn.close()
 
     def copy(self):
+        # Patched by Zhihu, to be compatible with gevent
         """
         Create an inactive copy of the client object, suitable for passing
         to a separate thread.
@@ -398,10 +400,15 @@ class KafkaClient(object):
         Note that the copied connections are not initialized, so reinit() must
         be called on the returned copy.
         """
-        c = copy.deepcopy(self)
-        for key in c.conns:
-            c.conns[key] = self.conns[key].copy()
-        return c
+        return KafkaClient(hosts=['{0}:{1}'.format(entry[0], entry[1]) for entry in self.hosts],
+                           client_id=self.client_id,
+                           timeout=self.timeout,
+                           correlation_id=self.correlation_id)
+        # ORIGINAL CODE HERE
+        # c = copy.deepcopy(self)
+        # for key in c.conns:
+        #     c.conns[key] = self.conns[key].copy()
+        # return c
 
     def reinit(self):
         for conn in self.conns.values():
@@ -607,7 +614,7 @@ class KafkaClient(object):
         else:
             decoder = KafkaProtocol.decode_produce_response
 
-        resps = self._send_broker_aware_request(payloads, encoder, decoder)
+        resps = self._send_broker_aware_request(payloads, encoder, decoder, fail_on_error)
 
         return [resp if not callback else callback(resp) for resp in resps
                 if resp is not None and
@@ -628,7 +635,7 @@ class KafkaClient(object):
 
         resps = self._send_broker_aware_request(
             payloads, encoder,
-            KafkaProtocol.decode_fetch_response)
+            KafkaProtocol.decode_fetch_response, fail_on_error)
 
         return [resp if not callback else callback(resp) for resp in resps
                 if not fail_on_error or not self._raise_on_response_error(resp)]
